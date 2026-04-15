@@ -1,10 +1,17 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::mem;
 use std::rc::Weak;
 use std::time::Instant;
 
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
+
+thread_local! {
+    /// Global storage for the ApplicationDelegate, so it can be retrieved without
+    /// going through NSApplication.delegate(). This allows external code to replace
+    /// the NSApplication delegate without breaking winit's internal state access.
+    static WINIT_DELEGATE: OnceCell<Retained<ApplicationDelegate>> = const { OnceCell::new() };
+}
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSRunningApplication,
 };
@@ -99,7 +106,10 @@ impl ApplicationDelegate {
             wait_timeout: Cell::new(None),
             pending_redraw: RefCell::new(vec![]),
         });
-        unsafe { msg_send_id![super(this), init] }
+        let delegate: Retained<Self> = unsafe { msg_send_id![super(this), init] };
+        // Store in thread-local so get() can find it even if the NSApp delegate is replaced.
+        WINIT_DELEGATE.with(|cell| { let _ = cell.set(delegate.clone()); });
+        delegate
     }
 
     // NOTE: This will, globally, only be run once, no matter how many
@@ -171,16 +181,14 @@ impl ApplicationDelegate {
         self.internal_exit();
     }
 
-    pub fn get(mtm: MainThreadMarker) -> Retained<Self> {
-        let app = NSApplication::sharedApplication(mtm);
-        let delegate =
-            unsafe { app.delegate() }.expect("a delegate was not configured on the application");
-        if delegate.is_kind_of::<Self>() {
-            // SAFETY: Just checked that the delegate is an instance of `ApplicationDelegate`
-            unsafe { Retained::cast(delegate) }
-        } else {
-            panic!("tried to get a delegate that was not the one Winit has registered")
-        }
+    pub fn get(_mtm: MainThreadMarker) -> Retained<Self> {
+        // Retrieve from thread-local instead of NSApplication.delegate().
+        // This allows external code to replace the delegate without breaking winit.
+        WINIT_DELEGATE.with(|cell| {
+            cell.get()
+                .expect("tried to get application state before it was registered")
+                .clone()
+        })
     }
 
     /// Place the event handler in the application delegate for the duration
