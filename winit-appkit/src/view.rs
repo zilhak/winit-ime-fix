@@ -123,6 +123,10 @@ pub struct ViewState {
     ime_state: Cell<ImeState>,
     input_source: RefCell<String>,
 
+    /// Set in key_down when the input source has just changed.
+    /// Used to retry interpretKeyEvents for CJK IME first-char fix.
+    input_source_changed: Cell<bool>,
+
     /// True iff the application wants IME events.
     ///
     /// Can be set using `set_ime_allowed`
@@ -392,9 +396,20 @@ define_class!(
 
             // Commit only if we have marked text.
             if self.hasMarkedText() && self.is_ime_enabled() && !is_control {
+                // Clear marked text as required by the NSTextInputClient protocol.
+                // This prevents subsequent insertText calls (e.g., for a trailing
+                // space) from incorrectly seeing stale marked text.
+                *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
+            } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
+                // After committing composed text (e.g., Korean "한"), the IME may
+                // send a second insertText for the triggering character (e.g.,
+                // space). Forward it to the app as a regular key event instead of
+                // committing it again through IME, which would cause double input.
+                self.ivars().forward_key_to_app.set(true);
             }
         }
 
@@ -403,14 +418,6 @@ define_class!(
         #[unsafe(method(doCommandBySelector:))]
         fn do_command_by_selector(&self, command: Sel) {
             trace_scope!("doCommandBySelector:");
-
-            // We shouldn't forward any character from just committed text, since we'll end up
-            // sending it twice with some IMEs like Korean one. We'll also always send
-            // `Enter` in that case, which is not desired given it was used to confirm
-            // IME input.
-            if self.ivars().ime_state.get() == ImeState::Committed {
-                return;
-            }
 
             self.ivars().forward_key_to_app.set(true);
 
@@ -445,11 +452,16 @@ define_class!(
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
-                if *prev_input_source != current_input_source && self.is_ime_enabled() {
+                if *prev_input_source != current_input_source {
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
-                    self.ivars().ime_state.set(ImeState::Disabled);
-                    self.queue_event(WindowEvent::Ime(Ime::Disabled));
+                    if self.is_ime_enabled() {
+                        self.queue_event(WindowEvent::Ime(Ime::Disabled));
+                    }
+                    self.ivars().ime_state.set(ImeState::Ground);
+                    self.ivars().input_source_changed.set(true);
+                } else {
+                    drop(prev_input_source);
                 }
             }
 
@@ -467,6 +479,22 @@ define_class!(
             if self.ivars().ime_capabilities.get().is_some() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
                 self.interpretKeyEvents(&events_for_nsview);
+
+                // macOS Korean IME quirk: After an input source switch (e.g.
+                // English→Korean), the first interpretKeyEvents call may
+                // trigger insertText instead of setMarkedText because the IME
+                // hasn't fully transitioned. If the input source just changed
+                // and the IME didn't produce a preedit or commit (state is
+                // still Ground, forward_key_to_app is false), retry once —
+                // the second call goes through the now-active IME correctly.
+                if self.ivars().input_source_changed.get()
+                    && self.ivars().ime_state.get() == ImeState::Ground
+                    && !self.ivars().forward_key_to_app.get()
+                {
+                    self.ivars().input_source_changed.set(false);
+                    self.interpretKeyEvents(&events_for_nsview);
+                }
+                self.ivars().input_source_changed.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -805,6 +833,7 @@ impl WinitView {
             tracking_rect: Default::default(),
             ime_state: Default::default(),
             input_source: Default::default(),
+            input_source_changed: Default::default(),
             ime_capabilities: Default::default(),
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
