@@ -17,9 +17,10 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use crate::error::NotSupportedError;
 use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
 use crate::monitor::MonitorHandle;
-use crate::window::{Window, WindowAttributes};
+use crate::window::{ActivationToken, Window, WindowAttributes};
 
 pub use crate::window::Theme;
 
@@ -81,6 +82,17 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+
+    /// Ask the compositor to activate this window with an [`ActivationToken`] obtained
+    /// elsewhere, for example the `XDG_ACTIVATION_TOKEN` that a second launch of the
+    /// application received and handed to the running instance.
+    ///
+    /// Uses `xdg_activation_v1::activate`. The compositor decides whether the token is
+    /// still valid and may only mark the window as urgent.
+    ///
+    /// Returns [`NotSupportedError`] for an X11 window or when the compositor does not
+    /// offer `xdg_activation_v1`.
+    fn activate_with_token(&self, token: ActivationToken) -> Result<(), NotSupportedError>;
 }
 
 impl WindowExtWayland for Window {
@@ -92,6 +104,19 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::X(_) => None,
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
+        }
+    }
+
+    #[inline]
+    fn activate_with_token(&self, token: ActivationToken) -> Result<(), NotSupportedError> {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => {
+                let _ = token;
+                Err(NotSupportedError::new())
+            },
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.activate_with_token(token),
         }
     }
 }

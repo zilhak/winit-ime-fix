@@ -39,3 +39,7 @@ The migration guide could reference other migration examples in the current
 changelog entry.
 
 ## Unreleased
+
+### Added
+
+- On Wayland, add `WindowExtWayland::activate_with_token` to activate an existing window with an `ActivationToken` obtained elsewhere (for example the `XDG_ACTIVATION_TOKEN` a second launch received).

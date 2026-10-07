@@ -24,7 +24,7 @@ use crate::platform_impl::{
     Fullscreen, MonitorHandle as PlatformMonitorHandle, OsError, PlatformIcon,
 };
 use crate::window::{
-    Cursor, CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType,
+    ActivationToken, Cursor, CursorGrabMode, ImePurpose, ResizeDirection, Theme, UserAttentionType,
     WindowAttributes, WindowButtons, WindowLevel,
 };
 
@@ -541,6 +541,21 @@ impl Window {
         let xdg_activation_token = xdg_activation.get_activation_token(&self.queue_handle, data);
         xdg_activation_token.set_surface(&surface);
         xdg_activation_token.commit();
+    }
+
+    /// Activate this window with a token that another client obtained, e.g. the
+    /// `XDG_ACTIVATION_TOKEN` a second launch of the application received.
+    pub fn activate_with_token(&self, token: ActivationToken) -> Result<(), NotSupportedError> {
+        let xdg_activation = match self.xdg_activation.as_ref() {
+            Some(xdg_activation) => xdg_activation,
+            None => return Err(NotSupportedError::new()),
+        };
+
+        xdg_activation.activate(token.token, self.surface());
+        // The request may come from outside a dispatch; wake the loop so it gets flushed.
+        self.event_loop_awakener.ping();
+
+        Ok(())
     }
 
     pub fn request_activation_token(&self) -> Result<AsyncRequestSerial, NotSupportedError> {
