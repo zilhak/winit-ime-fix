@@ -243,6 +243,12 @@ pub unsafe extern "C" fn xim_destroy_callback(
         let xconn = unsafe { &(*inner).xconn };
         if unsafe { !(*inner).is_fallback } {
             let _ = unsafe { set_instantiate_callback(xconn, client_data) };
+            // libX11 runs the instantiate callback right away when a server is already available
+            // (`_XimRegisterIMInstantiateCallback`), which may have reopened the input method.
+            // Replacing it with a fallback then would leave no callback to reopen it again.
+            if unsafe { !(*inner).is_destroyed } {
+                return;
+            }
             // Attempt to open fallback input method.
             match unsafe { replace_im(inner) } {
                 Ok(()) => unsafe { (*inner).is_fallback = true },
