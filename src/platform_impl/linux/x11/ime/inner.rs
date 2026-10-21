@@ -154,10 +154,15 @@ impl ImeInner {
             contexts.into_iter().for_each(mem::forget);
             return Ok(false);
         }
+        // `XDestroyIC` frees the context in libX11 even when the server reports an error, so the
+        // callback data can be dropped either way. Destroy every context before reporting.
+        let mut result = Ok(true);
         for context in contexts {
-            unsafe { destroy_ic(&self.xconn, context.ic)? };
+            if let Err(err) = unsafe { destroy_ic(&self.xconn, context.ic) } {
+                result = result.and(Err(err));
+            }
         }
-        Ok(true)
+        result
     }
 
     pub unsafe fn destroy_all_contexts_if_necessary(&mut self) -> Result<bool, XError> {

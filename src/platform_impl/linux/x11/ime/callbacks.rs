@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::mem;
 use std::os::raw::c_char;
 use std::ptr;
 use std::sync::Arc;
@@ -86,11 +87,22 @@ enum ReplaceImError {
     ServerChanged,
 }
 
-// Closes an input method that never became current. Closing waits for its server, so it is
-// skipped when the server already changed; libX11 frees it once the server window is destroyed.
-unsafe fn discard_new_im(xconn: &Arc<XConnection>, new_im: &InputMethod) {
+// Releases an input method that never became current, with the contexts already created on it.
+// Closing waits for its server, so it is skipped when the server already changed. libX11 then
+// keeps the input method and its contexts until the server window is destroyed, and may still
+// call their preedit callbacks, so their callback data is kept alive. Its destroy callback is
+// ignored by `xim_destroy_callback` because it is not the current input method.
+unsafe fn discard_new_im(
+    xconn: &Arc<XConnection>,
+    new_im: &InputMethod,
+    contexts: HashMap<ffi::Window, Option<ImeContext>>,
+) {
     if unsafe { new_im.server.owners_unchanged(xconn) } {
+        // `XCloseIM` destroys every context of the input method.
         let _ = unsafe { close_im(xconn, new_im.im) };
+        drop(contexts);
+    } else {
+        contexts.into_values().flatten().for_each(mem::forget);
     }
 }
 
@@ -118,7 +130,7 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
     {
         let result = unsafe { set_destroy_callback(xconn, new_im.im, &*inner) };
         if result.is_err() {
-            unsafe { discard_new_im(xconn, &new_im) };
+            unsafe { discard_new_im(xconn, &new_im, HashMap::new()) };
         }
         result
     }
@@ -128,7 +140,7 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
     // selection owners: filtering events here could re-enter this function through the destroy
     // callback while the contexts are being iterated.
     if !unsafe { new_im.server.owners_unchanged(xconn) } {
-        unsafe { discard_new_im(xconn, &new_im) };
+        unsafe { discard_new_im(xconn, &new_im, HashMap::new()) };
         return Err(ReplaceImError::ServerChanged);
     }
 
@@ -140,23 +152,25 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
         let is_allowed =
             old_context.as_ref().map(|old_context| old_context.is_allowed()).unwrap_or_default();
 
-        let new_context = {
-            let result = unsafe {
-                ImeContext::new(
-                    xconn,
-                    &new_im,
-                    *window,
-                    spot,
-                    (*inner).event_sender.clone(),
-                    is_allowed,
-                )
-            };
-            if result.is_err() {
-                unsafe { discard_new_im(xconn, &new_im) };
-            }
-            result.map_err(ReplaceImError::ContextCreationFailed)?
+        let result = unsafe {
+            ImeContext::new(
+                xconn,
+                &new_im,
+                *window,
+                spot,
+                (*inner).event_sender.clone(),
+                is_allowed,
+            )
         };
-        new_contexts.insert(*window, Some(new_context));
+        match result {
+            Ok(new_context) => {
+                new_contexts.insert(*window, Some(new_context));
+            },
+            Err(err) => {
+                unsafe { discard_new_im(xconn, &new_im, new_contexts) };
+                return Err(ReplaceImError::ContextCreationFailed(err));
+            },
+        }
     }
 
     // If we've made it this far, everything succeeded.
@@ -182,10 +196,14 @@ pub unsafe extern "C" fn xim_instantiate_callback(
     if !inner.is_null() {
         let xconn = unsafe { &(*inner).xconn };
         match unsafe { replace_im(inner) } {
+            // `replace_im` opened a fallback because the input method from `XMODIFIERS` did not
+            // open or its server could not be verified; keep waiting for the server.
+            Ok(()) if unsafe { (*inner).is_fallback } => {
+                tracing::warn!("XIM server available but only a fallback input method opened")
+            },
             Ok(()) => unsafe {
                 tracing::info!("XIM server available; reopened the input method");
                 let _ = unset_instantiate_callback(xconn, client_data);
-                (*inner).is_fallback = false;
             },
             // The new server changed owner right after it was opened; the instantiate callback
             // stays registered and tries again.

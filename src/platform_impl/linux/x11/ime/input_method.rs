@@ -33,7 +33,7 @@ unsafe fn open_im(
         // Read back the modifiers libX11 used: it appends `XMODIFIERS` to ours and keeps the
         // previous value when ours are malformed.
         let modifiers = unsafe { current_locale_modifiers(xconn) };
-        Some((im, unsafe { ServerBinding::record(xconn, &modifiers) }))
+        Some((im, unsafe { ServerBinding::record(xconn, im, &modifiers) }))
     }
 }
 
@@ -55,10 +55,11 @@ impl InputMethod {
     ) -> Option<Self> {
         let mut styles: *mut XIMStyles = std::ptr::null_mut();
 
-        // Querying the styles waits for the server. If it was replaced right after opening, do not
-        // ask it; the input method is released by libX11 once the server window is destroyed.
+        // Querying the styles waits for the server. If it cannot be verified (it was replaced or
+        // went away right after opening), do not ask it; the input method has no callbacks or
+        // contexts yet and libX11 releases it once the server window is destroyed.
         if !unsafe { server.owners_unchanged(xconn) } {
-            tracing::warn!("XIM server changed while opening {name:?}; not querying input styles");
+            tracing::warn!("cannot verify the XIM server of {name:?}; not querying input styles");
             return None;
         }
 

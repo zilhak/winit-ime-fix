@@ -18,7 +18,10 @@
 // our destroy callback). If no such event is queued the old server may still be alive; the
 // request is skipped, but the input method is not treated as destroyed.
 //
-// This cannot help when the server dies after the check, or when it is alive but not answering.
+// This cannot help when the server dies after the check, when it is alive but not answering, or
+// when it dies while `XOpenIM` negotiates with it. An input method opened with an empty name whose
+// server is gone or replaced before it is recorded is indistinguishable from local processing and
+// is recorded as local.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
@@ -42,67 +45,60 @@ const THAI_IM_NAMES: [&[u8]; 5] = [b"", b"BasicCheck", b"Strict", b"Thaicat", b"
 pub(crate) enum ServerBinding {
     /// libX11 processes input locally (compose tables) and never waits for a server.
     Local,
-    /// Selections when the input method was opened. One entry when the server could be
-    /// identified; otherwise every candidate, any of whose change makes the server unverifiable.
+    /// Selections whose owner libX11 connected to (it selected `StructureNotify` on the owner).
     Servers(Vec<ServerSelection>),
+    /// libX11 connected to a server that is already gone or replaced, so none can be trusted.
+    Unverified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ServerSelection {
     atom: ffi::Atom,
     owner: ffi::Window,
-    /// This connection selected `StructureNotify` on `owner`, i.e. libX11 connected to it.
-    selected: bool,
 }
 
 impl ServerBinding {
-    /// Records the server of the input method that `XOpenIM` just opened with `modifiers` (the
-    /// value returned by `XSetLocaleModifiers(NULL)`, i.e. what libX11 actually used).
+    /// Records the server of `im`, which `XOpenIM` just opened with `modifiers` (the value
+    /// returned by `XSetLocaleModifiers(NULL)`, i.e. what libX11 actually used).
     ///
     /// libX11 (`_XimPreConnect`) walks `XIM_SERVERS` in order and uses the first atom that has an
     /// owner, whose name matches the input method name and that accepts the locale and transport.
     /// The locale/transport negotiation cannot be repeated without talking to the servers, so the
     /// connected atom is identified by the `StructureNotify` selection that libX11 places on its
     /// owner (`_XimRegisterServerFilter`), which `your_event_mask` reports for this connection.
-    pub(crate) unsafe fn record(xconn: &Arc<XConnection>, modifiers: &[u8]) -> Self {
+    pub(crate) unsafe fn record(xconn: &Arc<XConnection>, im: ffi::XIM, modifiers: &[u8]) -> Self {
         let im_name = im_name_from_modifiers(modifiers);
         // `_XimCheckIfLocalProcessing`: these names never reach a server.
         if im_name == b"local" || im_name == b"none" {
             return ServerBinding::Local;
         }
 
-        let candidates: Vec<(ffi::Atom, ffi::Window)> = unsafe { xim_server_atoms(xconn) }
+        let connected: Vec<ServerSelection> = unsafe { xim_server_atoms(xconn) }
             .into_iter()
             .filter(|(_, name)| server_name_matches(name, im_name))
             .filter_map(|(atom, _)| {
                 let owner = unsafe { selection_owner(xconn, atom) };
-                (owner != 0).then_some((atom, owner))
+                (owner != 0 && selects_structure_notify(xconn, owner))
+                    .then_some(ServerSelection { atom, owner })
             })
             .collect();
-
-        let connected: Vec<ServerSelection> = candidates
-            .iter()
-            .filter(|&&(_, owner)| selects_structure_notify(xconn, owner))
-            .map(|&(atom, owner)| ServerSelection { atom, owner, selected: true })
-            .collect();
-
         if !connected.is_empty() {
             return ServerBinding::Servers(connected);
         }
-        // A protocol input method always selects `StructureNotify` on its server before
-        // `XOpenIM` returns. Without one, an empty or Thai name means libX11 chose local or Thai
-        // processing (an empty name uses the compose file of the locale when there is one).
-        if candidates.is_empty() || THAI_IM_NAMES.contains(&im_name) {
-            ServerBinding::Local
-        } else {
-            // The owner changed while the input method was being opened. Check every candidate.
-            ServerBinding::Servers(
-                candidates
-                    .into_iter()
-                    .map(|(atom, owner)| ServerSelection { atom, owner, selected: false })
-                    .collect(),
-            )
+
+        // A protocol input method selects `StructureNotify` on its server before `XOpenIM`
+        // returns, so libX11 either processed this one itself or its server is gone or replaced.
+        if im_name.is_empty() {
+            // libX11 processes an empty name locally when the locale has a compose file, which
+            // cannot be told apart from a lost server here.
+            return ServerBinding::Local;
         }
+        if THAI_IM_NAMES.contains(&im_name) && unsafe { is_thai_locale(xconn, im) } {
+            // `_XimCheckIfThaiProcessing`.
+            return ServerBinding::Local;
+        }
+        // libX11 serves every other name through a server.
+        ServerBinding::Unverified
     }
 
     /// Whether every recorded selection still has the recorded owner, and that owner is still
@@ -112,15 +108,16 @@ impl ServerBinding {
             ServerBinding::Local => true,
             ServerBinding::Servers(servers) => servers.iter().all(|server| {
                 (unsafe { selection_owner(xconn, server.atom) }) == server.owner
-                    && (!server.selected || selects_structure_notify(xconn, server.owner))
+                    && selects_structure_notify(xconn, server.owner)
             }),
+            ServerBinding::Unverified => false,
         }
     }
 
     /// Server windows whose `DestroyNotify` libX11 may be waiting for.
     pub(crate) fn windows(&self) -> impl Iterator<Item = ffi::Window> + '_ {
         let servers = match self {
-            ServerBinding::Local => &[][..],
+            ServerBinding::Local | ServerBinding::Unverified => &[][..],
             ServerBinding::Servers(servers) => &servers[..],
         };
         servers.iter().map(|server| server.owner)
@@ -227,6 +224,19 @@ unsafe fn xim_server_atoms(xconn: &Arc<XConnection>) -> Vec<(ffi::Atom, Vec<u8>)
     result
 }
 
+/// Whether the language of the locale of `im` is Thai (`THAI_LANGUAGE_NAME`).
+unsafe fn is_thai_locale(xconn: &Arc<XConnection>, im: ffi::XIM) -> bool {
+    let locale = unsafe { (xconn.xlib.XLocaleOfIM)(im) };
+    !locale.is_null() && locale_language(unsafe { CStr::from_ptr(locale) }.to_bytes()) == b"th"
+}
+
+/// The language part of a locale name such as `th_TH.UTF-8`.
+fn locale_language(locale: &[u8]) -> &[u8] {
+    let end =
+        locale.iter().position(|&byte| matches!(byte, b'_' | b'.' | b'@')).unwrap_or(locale.len());
+    &locale[..end]
+}
+
 unsafe fn selection_owner(xconn: &Arc<XConnection>, atom: ffi::Atom) -> ffi::Window {
     unsafe { (xconn.xlib.XGetSelectionOwner)(xconn.display, atom) }
 }
@@ -256,6 +266,15 @@ mod tests {
         assert_eq!(im_name_from_modifiers(b"@im=fcitx"), b"fcitx");
         assert_eq!(im_name_from_modifiers(b""), b"");
         assert_eq!(im_name_from_modifiers(b"@other=x"), b"");
+    }
+
+    #[test]
+    fn locale_language_stops_at_territory_codeset_or_modifier() {
+        assert_eq!(locale_language(b"th_TH.UTF-8"), b"th");
+        assert_eq!(locale_language(b"th"), b"th");
+        assert_eq!(locale_language(b"th.TIS-620"), b"th");
+        assert_eq!(locale_language(b"ko_KR.UTF-8"), b"ko");
+        assert_eq!(locale_language(b"C"), b"C");
     }
 
     #[test]
