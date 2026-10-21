@@ -90,7 +90,8 @@ enum ReplaceImError {
 // Releases an input method that never became current, with the contexts already created on it.
 // Closing waits for its server, so it is skipped when the server already changed. libX11 then
 // keeps the input method and its contexts until the server window is destroyed, and may still
-// call their preedit callbacks, so their callback data is kept alive. Its destroy callback is
+// call their preedit callbacks, so their Rust callback data is intentionally leaked for the
+// process lifetime (libX11 freeing the XIC does not reclaim the Rust Box). Its destroy callback is
 // ignored by `xim_destroy_callback` because it is not the current input method.
 unsafe fn discard_new_im(
     xconn: &Arc<XConnection>,
@@ -186,44 +187,50 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
     Ok(())
 }
 
+// Called only after XFilterEvent / XIM callbacks have returned, with no context references held.
+// Keeping an instantiate registration alone is insufficient: libX11 sets its private `call`
+// flag before invoking it, and resetting that flag compares the current locale modifiers with
+// the registration's modifiers. Opening @im=local can make that comparison fail. Retry directly
+// on a later XIM_SERVERS notification instead of re-registering recursively inside a callback.
+pub(crate) unsafe fn retry_reconnect(inner: *mut ImeInner, server_changed: bool) -> bool {
+    if unsafe { (*inner).im.is_none() || !(*inner).reconnect.take(server_changed) } {
+        return false;
+    }
+    match unsafe { replace_im(inner) } {
+        Ok(()) => unsafe {
+            let primary = !(*inner).is_fallback;
+            (*inner).reconnect.complete(primary);
+            if primary {
+                tracing::info!("XIM server available; reopened the input method");
+                let _ = unset_instantiate_callback(&(*inner).xconn, inner as _);
+            } else {
+                tracing::warn!(
+                    "only a fallback input method opened; waiting for XIM_SERVERS change"
+                );
+            }
+        },
+        Err(ReplaceImError::ServerChanged) => {
+            tracing::warn!("XIM server changed while reopening the input method");
+        },
+        Err(err) => unsafe {
+            if (*inner).is_destroyed {
+                panic!("Failed to reopen input method: {err:?}");
+            }
+        },
+    }
+    true
+}
+
 pub unsafe extern "C" fn xim_instantiate_callback(
     _display: *mut ffi::Display,
     client_data: ffi::XPointer,
-    // This field is unsupplied.
     _call_data: ffi::XPointer,
 ) {
     let inner: *mut ImeInner = client_data as _;
     if !inner.is_null() {
-        // libX11 calls this right away when it is registered while a server is available, which
-        // happens inside `Ime::new` before any input method is set (for instance when the
-        // `XMODIFIERS` input method could not be verified). `Ime::new` opens the fallback itself
-        // and the callback stays registered.
-        if unsafe { (*inner).im.is_none() } {
-            return;
-        }
-        let xconn = unsafe { &(*inner).xconn };
-        match unsafe { replace_im(inner) } {
-            // `replace_im` opened a fallback because the input method from `XMODIFIERS` did not
-            // open or its server could not be verified; keep waiting for the server.
-            Ok(()) if unsafe { (*inner).is_fallback } => {
-                tracing::warn!("XIM server available but only a fallback input method opened")
-            },
-            Ok(()) => unsafe {
-                tracing::info!("XIM server available; reopened the input method");
-                let _ = unset_instantiate_callback(xconn, client_data);
-            },
-            // The new server changed owner right after it was opened; the instantiate callback
-            // stays registered and tries again.
-            Err(ReplaceImError::ServerChanged) => {
-                tracing::warn!("XIM server changed while reopening the input method")
-            },
-            Err(err) => unsafe {
-                if (*inner).is_destroyed {
-                    // We have no usable input methods!
-                    panic!("Failed to reopen input method: {err:?}");
-                }
-            },
-        }
+        // Registration may invoke this before Ime::new has an IM, or while libX11 holds its
+        // callback-list lock. Do not reopen, re-register or borrow PotentialInputMethods here.
+        unsafe { (*inner).reconnect.request() };
     }
 }
 
@@ -250,24 +257,10 @@ pub unsafe extern "C" fn xim_destroy_callback(
         let xconn = unsafe { &(*inner).xconn };
         if unsafe { !(*inner).is_fallback } {
             let _ = unsafe { set_instantiate_callback(xconn, client_data) };
-            // libX11 runs the instantiate callback right away when a server is already available
-            // (`_XimRegisterIMInstantiateCallback`), which may have reopened the input method.
-            // Replacing it with a fallback then would leave no callback to reopen it again.
-            if unsafe { !(*inner).is_destroyed } {
-                return;
-            }
-            // Attempt to open fallback input method.
-            match unsafe { replace_im(inner) } {
-                Ok(()) => unsafe { (*inner).is_fallback = true },
-                // Stays destroyed until the instantiate callback opens an input method.
-                Err(ReplaceImError::ServerChanged) => {
-                    tracing::warn!("XIM server changed while opening a fallback input method")
-                },
-                Err(err) => {
-                    // We have no usable input methods!
-                    panic!("Failed to open fallback input method: {err:?}");
-                },
-            }
+            // Both the immediate instantiate callback and this destruction request coalesce.
+            // Opening only after this callback returns also prevents a successful immediate
+            // reconnect from being overwritten by a subsequent fallback open.
+            unsafe { (*inner).reconnect.request() };
         }
     }
 }

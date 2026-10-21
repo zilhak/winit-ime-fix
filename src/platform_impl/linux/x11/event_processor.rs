@@ -79,9 +79,23 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
+        // Inspect the advertisement before filtering: Xlib may consume it even when its
+        // instantiate callback only queued work. No IM/context borrow crosses XFilterEvent.
+        let server_changed = if xev.get_type() == xlib::PropertyNotify {
+            let event: &XPropertyEvent = xev.as_ref();
+            let wt = Self::window_target(&self.target);
+            event.atom == wt.xconn.atoms()[XIM_SERVERS].into()
+                && event.window == unsafe { (wt.xconn.xlib.XRootWindow)(wt.xconn.display, 0) }
+                && event.state == xlib::PropertyNewValue
+        } else {
+            false
+        };
         self.process_xevent(xev, &mut callback);
 
         let window_target = Self::window_target_mut(&mut self.target);
+        if let Some(ime) = window_target.ime.as_mut() {
+            ime.get_mut().retry_reconnect(server_changed);
+        }
 
         // Handle IME requests.
         while let Ok(request) = self.ime_receiver.try_recv() {

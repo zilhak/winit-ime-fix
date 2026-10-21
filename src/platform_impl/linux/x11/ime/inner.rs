@@ -21,6 +21,36 @@ pub(crate) unsafe fn destroy_ic(xconn: &Arc<XConnection>, ic: ffi::XIC) -> Resul
     xconn.check_errors()
 }
 
+/// A callback only requests work. A failed attempt waits for an actual server advertisement,
+/// rather than retrying on every key or event-loop iteration.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) enum Reconnect {
+    #[default]
+    Idle,
+    Pending,
+    WaitingForServer,
+}
+
+impl Reconnect {
+    pub fn request(&mut self) {
+        *self = Self::Pending;
+    }
+
+    pub fn take(&mut self, server_changed: bool) -> bool {
+        match self {
+            Self::Pending => {},
+            Self::WaitingForServer if server_changed => {},
+            _ => return false,
+        }
+        *self = Self::WaitingForServer;
+        true
+    }
+
+    pub fn complete(&mut self, primary: bool) {
+        *self = if primary { Self::Idle } else { Self::WaitingForServer };
+    }
+}
+
 pub(crate) struct ImeInner {
     pub xconn: Arc<XConnection>,
     pub im: Option<InputMethod>,
@@ -38,6 +68,7 @@ pub(crate) struct ImeInner {
     // Unlike `is_destroyed`, the input method and its contexts are still owned by libX11 and are
     // only released through its destroy path.
     pub server_suspect: Cell<bool>,
+    pub reconnect: Reconnect,
 }
 
 impl ImeInner {
@@ -56,6 +87,7 @@ impl ImeInner {
             is_destroyed: false,
             is_fallback: false,
             server_suspect: Cell::new(false),
+            reconnect: Reconnect::default(),
         }
     }
 
@@ -94,7 +126,7 @@ impl ImeInner {
 
     /// Like [`Self::server_reachable`], but when the owner changed, first lets libX11 handle a
     /// queued `DestroyNotify` of the server window. That runs [`super::xim_destroy_callback`],
-    /// which may replace `im` and `contexts`, so no reference into `*inner` may be held across
+    /// which updates destruction/reconnect state. No reference into `*inner` may be held across
     /// this call, and it must not be called while iterating the contexts or from an XIM callback.
     pub unsafe fn ensure_server_alive(inner: *mut ImeInner) -> bool {
         if unsafe { (*inner).owners_unchanged() } {
@@ -115,8 +147,8 @@ impl ImeInner {
             unsafe { (*inner).mark_suspect() };
             return false;
         }
-        // The destroy callback opened a new input method (a fallback or the new server). Its
-        // server was recorded when it was opened.
+        // Re-read after Xlib callbacks. Reconnection normally stays queued until the caller
+        // returns from filtering; the previous input method must not be used in the meantime.
         match unsafe { (*inner).im.as_ref() } {
             Some(new_im) if new_im.im != im => unsafe { (*inner).server_reachable() },
             _ => false,
@@ -150,7 +182,8 @@ impl ImeInner {
         }
         if !self.server_reachable() {
             // The context stays alive in libX11 until the server window is destroyed, and the
-            // server may still send preedit callbacks to it, so keep its callback data.
+            // server may still send preedit callbacks to it. This intentionally leaks the Rust
+            // callback data for the process lifetime; freeing the XIC does not reclaim that Box.
             contexts.into_iter().for_each(mem::forget);
             return Ok(false);
         }
@@ -168,5 +201,47 @@ impl ImeInner {
     pub unsafe fn destroy_all_contexts_if_necessary(&mut self) -> Result<bool, XError> {
         let contexts = mem::take(&mut self.contexts);
         unsafe { self.destroy_contexts(contexts.into_values().flatten()) }
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::Reconnect;
+
+    #[test]
+    fn an_immediate_callback_is_deferred_until_initialization_has_returned() {
+        let mut retry = Reconnect::default();
+        retry.request(); // Registration invoked the callback while im was None.
+        retry.request(); // Coalesce callbacks; do not recurse into opening an IM.
+        assert!(retry.take(false));
+        retry.complete(false); // Only a local fallback opened.
+        for _ in 0..100 {
+            assert!(!retry.take(false)); // Keys/ordinary iterations cannot spin retries.
+        }
+        assert!(retry.take(true)); // A later XIM_SERVERS notification, even if Xlib call=True.
+        retry.complete(true);
+        assert!(!retry.take(true)); // A verified primary does not reopen on other advertisements.
+    }
+
+    #[test]
+    fn a_failed_reconnect_remains_eligible_for_a_later_server_only() {
+        let mut retry = Reconnect::default();
+        retry.request();
+        assert!(retry.take(false));
+        // An error leaves the state waiting just as Ok(local) does.
+        assert!(!retry.take(false));
+        assert!(retry.take(true));
+        assert!(!retry.take(false));
+        retry.complete(true);
+        assert!(!retry.take(false));
+        retry.request(); // Destruction of this primary schedules one replacement.
+        assert!(retry.take(false));
+    }
+
+    #[test]
+    fn a_local_only_session_does_not_start_retrying_on_server_changes() {
+        let mut retry = Reconnect::default();
+        assert!(!retry.take(true));
+        assert!(!retry.take(false));
     }
 }

@@ -97,6 +97,9 @@ impl Ime {
                 result?;
             }
             inner.im = Some(input_method);
+            // The initial open and its registration callback have fully returned. A pending
+            // retry can now borrow PotentialInputMethods without reentering the initial borrow.
+            unsafe { retry_reconnect(&mut *inner, false) };
             Ok(Ime { xconn, inner })
         } else {
             Err(ImeCreationError::OpenFailure(Box::new(inner.potential_input_methods)))
@@ -112,7 +115,18 @@ impl Ime {
     /// method and every context; callers look them up again afterwards.
     pub fn ensure_server_alive(&mut self) -> bool {
         let inner: *mut ImeInner = &mut *self.inner;
-        unsafe { ImeInner::ensure_server_alive(inner) }
+        let alive = unsafe { ImeInner::ensure_server_alive(inner) };
+        // A queued DestroyNotify may have requested a reconnect. XFilterEvent has returned.
+        if unsafe { retry_reconnect(inner, false) } {
+            self.inner.server_reachable()
+        } else {
+            alive
+        }
+    }
+
+    /// Runs at the outer event boundary, after any Xlib callback and before IME requests.
+    pub fn retry_reconnect(&mut self, server_changed: bool) {
+        unsafe { retry_reconnect(&mut *self.inner, server_changed) };
     }
 
     // This pattern is used for various methods here:
