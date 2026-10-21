@@ -194,6 +194,13 @@ pub unsafe extern "C" fn xim_instantiate_callback(
 ) {
     let inner: *mut ImeInner = client_data as _;
     if !inner.is_null() {
+        // libX11 calls this right away when it is registered while a server is available, which
+        // happens inside `Ime::new` before any input method is set (for instance when the
+        // `XMODIFIERS` input method could not be verified). `Ime::new` opens the fallback itself
+        // and the callback stays registered.
+        if unsafe { (*inner).im.is_none() } {
+            return;
+        }
         let xconn = unsafe { &(*inner).xconn };
         match unsafe { replace_im(inner) } {
             // `replace_im` opened a fallback because the input method from `XMODIFIERS` did not

@@ -19,9 +19,7 @@
 // request is skipped, but the input method is not treated as destroyed.
 //
 // This cannot help when the server dies after the check, when it is alive but not answering, or
-// when it dies while `XOpenIM` negotiates with it. An input method opened with an empty name whose
-// server is gone or replaced before it is recorded is indistinguishable from local processing and
-// is recorded as local.
+// when it dies while `XOpenIM` negotiates with it.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int};
@@ -68,8 +66,7 @@ impl ServerBinding {
     /// owner (`_XimRegisterServerFilter`), which `your_event_mask` reports for this connection.
     pub(crate) unsafe fn record(xconn: &Arc<XConnection>, im: ffi::XIM, modifiers: &[u8]) -> Self {
         let im_name = im_name_from_modifiers(modifiers);
-        // `_XimCheckIfLocalProcessing`: these names never reach a server.
-        if im_name == b"local" || im_name == b"none" {
+        if name_is_always_local(im_name) {
             return ServerBinding::Local;
         }
 
@@ -82,23 +79,25 @@ impl ServerBinding {
                     .then_some(ServerSelection { atom, owner })
             })
             .collect();
-        if !connected.is_empty() {
-            return ServerBinding::Servers(connected);
-        }
+        let thai_local = THAI_IM_NAMES.contains(&im_name) && unsafe { is_thai_locale(xconn, im) };
+        Self::without_trusted_owner(connected, thai_local)
+    }
 
-        // A protocol input method selects `StructureNotify` on its server before `XOpenIM`
-        // returns, so libX11 either processed this one itself or its server is gone or replaced.
-        if im_name.is_empty() {
-            // libX11 processes an empty name locally when the locale has a compose file, which
-            // cannot be told apart from a lost server here.
-            return ServerBinding::Local;
+    /// The binding once the owners libX11 connected to are known. A protocol input method
+    /// selects `StructureNotify` on its server before `XOpenIM` returns, so without such an owner
+    /// libX11 either processed the input method itself or its server is gone or replaced. Only a
+    /// Thai name in a Thai locale is proven local here: libX11 tries local processing, then Thai
+    /// processing, and only then a server (`_XimImSportRec`), and the Thai check accepts these
+    /// names. An empty name elsewhere may have used the compose file of the locale or a server
+    /// that is gone, so it is unverified; the explicit `@im=local` candidate covers compose input.
+    fn without_trusted_owner(connected: Vec<ServerSelection>, thai_local: bool) -> Self {
+        if !connected.is_empty() {
+            ServerBinding::Servers(connected)
+        } else if thai_local {
+            ServerBinding::Local
+        } else {
+            ServerBinding::Unverified
         }
-        if THAI_IM_NAMES.contains(&im_name) && unsafe { is_thai_locale(xconn, im) } {
-            // `_XimCheckIfThaiProcessing`.
-            return ServerBinding::Local;
-        }
-        // libX11 serves every other name through a server.
-        ServerBinding::Unverified
     }
 
     /// Whether every recorded selection still has the recorded owner, and that owner is still
@@ -122,6 +121,11 @@ impl ServerBinding {
         };
         servers.iter().map(|server| server.owner)
     }
+}
+
+/// Names libX11 always processes itself (`_XimCheckIfLocalProcessing`).
+fn name_is_always_local(im_name: &[u8]) -> bool {
+    im_name == b"local" || im_name == b"none"
 }
 
 /// Takes the queued `DestroyNotify` of `window` out of the Xlib queue and passes it to
@@ -266,6 +270,36 @@ mod tests {
         assert_eq!(im_name_from_modifiers(b"@im=fcitx"), b"fcitx");
         assert_eq!(im_name_from_modifiers(b""), b"");
         assert_eq!(im_name_from_modifiers(b"@other=x"), b"");
+    }
+
+    #[test]
+    fn only_local_names_skip_the_server_lookup() {
+        assert!(name_is_always_local(b"local"));
+        assert!(name_is_always_local(b"none"));
+        assert!(!name_is_always_local(b""));
+        assert!(!name_is_always_local(b"ibus"));
+    }
+
+    #[test]
+    fn unidentified_server_is_never_trusted() {
+        // Without an owner carrying this connection's StructureNotify selection, nothing is
+        // recorded as a server whose owner could later compare equal to a new server.
+        assert_eq!(
+            ServerBinding::without_trusted_owner(Vec::new(), false),
+            ServerBinding::Unverified
+        );
+        assert_eq!(ServerBinding::without_trusted_owner(Vec::new(), true), ServerBinding::Local);
+        assert_eq!(ServerBinding::Unverified.windows().count(), 0);
+
+        let connected = vec![ServerSelection { atom: 1, owner: 2 }];
+        assert_eq!(
+            ServerBinding::without_trusted_owner(connected.clone(), false),
+            ServerBinding::Servers(connected.clone())
+        );
+        assert_eq!(
+            ServerBinding::without_trusted_owner(connected.clone(), true),
+            ServerBinding::Servers(connected)
+        );
     }
 
     #[test]
