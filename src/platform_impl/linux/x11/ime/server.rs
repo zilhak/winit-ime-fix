@@ -8,8 +8,11 @@
 //
 // Before every synchronous XIM request we therefore compare the current owners of the server
 // selections with the owners recorded when the input method was opened. `XGetSelectionOwner` is a
-// round trip to the X server only, so it returns even when the XIM server is gone. If the owner
-// changed we look for the server window's `DestroyNotify` (the round trip guarantees that every
+// round trip to the X server only, so it returns even when the XIM server is gone. A restarted
+// server can get the same window ID as the one it replaces (the X server reuses the resource ID
+// base of a disconnected client), so an equal owner is only trusted while this connection still
+// has the `StructureNotify` selection libX11 placed on the old window. If the owner changed we
+// look for the server window's `DestroyNotify` (the round trip guarantees that every
 // event the X server generated before the reply is in the Xlib queue) and filter only that event,
 // so libX11 tears the input method down through its normal path (`_XimServerDestroy`, which calls
 // our destroy callback). If no such event is queued the old server may still be alive; the
@@ -22,7 +25,7 @@ use std::os::raw::{c_char, c_int};
 use std::sync::Arc;
 use std::{mem, ptr};
 
-use x11rb::protocol::xproto;
+use x11rb::protocol::xproto::{self, ConnectionExt as _, EventMask};
 
 use super::super::atoms::*;
 use super::{ffi, XConnection};
@@ -39,10 +42,17 @@ const THAI_IM_NAMES: [&[u8]; 5] = [b"", b"BasicCheck", b"Strict", b"Thaicat", b"
 pub(crate) enum ServerBinding {
     /// libX11 processes input locally (compose tables) and never waits for a server.
     Local,
-    /// Selection atoms and their owners when the input method was opened. One entry when the
-    /// server could be identified; otherwise every candidate, any of whose change makes the
-    /// server unverifiable.
-    Servers(Vec<(ffi::Atom, ffi::Window)>),
+    /// Selections when the input method was opened. One entry when the server could be
+    /// identified; otherwise every candidate, any of whose change makes the server unverifiable.
+    Servers(Vec<ServerSelection>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerSelection {
+    atom: ffi::Atom,
+    owner: ffi::Window,
+    /// This connection selected `StructureNotify` on `owner`, i.e. libX11 connected to it.
+    selected: bool,
 }
 
 impl ServerBinding {
@@ -70,10 +80,10 @@ impl ServerBinding {
             })
             .collect();
 
-        let connected: Vec<(ffi::Atom, ffi::Window)> = candidates
+        let connected: Vec<ServerSelection> = candidates
             .iter()
-            .copied()
-            .filter(|&(_, owner)| unsafe { selects_structure_notify(xconn, owner) })
+            .filter(|&&(_, owner)| selects_structure_notify(xconn, owner))
+            .map(|&(atom, owner)| ServerSelection { atom, owner, selected: true })
             .collect();
 
         if !connected.is_empty() {
@@ -86,17 +96,24 @@ impl ServerBinding {
             ServerBinding::Local
         } else {
             // The owner changed while the input method was being opened. Check every candidate.
-            ServerBinding::Servers(candidates)
+            ServerBinding::Servers(
+                candidates
+                    .into_iter()
+                    .map(|(atom, owner)| ServerSelection { atom, owner, selected: false })
+                    .collect(),
+            )
         }
     }
 
-    /// Whether every recorded selection still has the recorded owner.
+    /// Whether every recorded selection still has the recorded owner, and that owner is still
+    /// the window libX11 selected `StructureNotify` on rather than a new one with a reused ID.
     pub(crate) unsafe fn owners_unchanged(&self, xconn: &Arc<XConnection>) -> bool {
         match self {
             ServerBinding::Local => true,
-            ServerBinding::Servers(servers) => servers
-                .iter()
-                .all(|&(atom, owner)| unsafe { selection_owner(xconn, atom) } == owner),
+            ServerBinding::Servers(servers) => servers.iter().all(|server| {
+                (unsafe { selection_owner(xconn, server.atom) }) == server.owner
+                    && (!server.selected || selects_structure_notify(xconn, server.owner))
+            }),
         }
     }
 
@@ -106,7 +123,7 @@ impl ServerBinding {
             ServerBinding::Local => &[][..],
             ServerBinding::Servers(servers) => &servers[..],
         };
-        servers.iter().map(|&(_, owner)| owner)
+        servers.iter().map(|server| server.owner)
     }
 }
 
@@ -214,16 +231,16 @@ unsafe fn selection_owner(xconn: &Arc<XConnection>, atom: ffi::Atom) -> ffi::Win
     unsafe { (xconn.xlib.XGetSelectionOwner)(xconn.display, atom) }
 }
 
-/// Whether this connection selected `StructureNotify` on `window`. A window destroyed in the
-/// meantime raises `BadWindow`, which is consumed here and reported as `false`.
-unsafe fn selects_structure_notify(xconn: &Arc<XConnection>, window: ffi::Window) -> bool {
-    let mut attributes: ffi::XWindowAttributes = unsafe { mem::zeroed() };
-    let status =
-        unsafe { (xconn.xlib.XGetWindowAttributes)(xconn.display, window, &mut attributes) };
-    if xconn.check_errors().is_err() || status == 0 {
-        return false;
-    }
-    attributes.your_event_mask & ffi::StructureNotifyMask != 0
+/// Whether this connection selected `StructureNotify` on `window` (`your_event_mask`). A window
+/// destroyed in the meantime is reported as `false`. Uses one XCB round trip; its error does not
+/// go through the Xlib error handler.
+fn selects_structure_notify(xconn: &Arc<XConnection>, window: ffi::Window) -> bool {
+    xconn
+        .xcb_connection()
+        .get_window_attributes(window as xproto::Window)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|attributes| attributes.your_event_mask.contains(EventMask::STRUCTURE_NOTIFY))
 }
 
 #[cfg(test)]

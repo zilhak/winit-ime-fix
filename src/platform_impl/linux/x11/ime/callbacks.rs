@@ -183,6 +183,7 @@ pub unsafe extern "C" fn xim_instantiate_callback(
         let xconn = unsafe { &(*inner).xconn };
         match unsafe { replace_im(inner) } {
             Ok(()) => unsafe {
+                tracing::info!("XIM server available; reopened the input method");
                 let _ = unset_instantiate_callback(xconn, client_data);
                 (*inner).is_fallback = false;
             },
@@ -219,6 +220,7 @@ pub unsafe extern "C" fn xim_destroy_callback(
             tracing::debug!("ignoring destruction of a replaced input method");
             return;
         }
+        tracing::info!("XIM server destroyed the input method");
         unsafe { (*inner).is_destroyed = true };
         let xconn = unsafe { &(*inner).xconn };
         if unsafe { !(*inner).is_fallback } {

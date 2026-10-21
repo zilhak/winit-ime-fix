@@ -63,23 +63,33 @@ impl ImeInner {
     /// without filtering any event. Safe to call while iterating the contexts and from XIM
     /// callbacks.
     pub fn server_reachable(&self) -> bool {
+        let reachable = self.owners_unchanged();
+        if !reachable {
+            self.mark_suspect();
+        }
+        reachable
+    }
+
+    fn owners_unchanged(&self) -> bool {
         let Some(im) = self.im.as_ref().filter(|_| !self.is_destroyed) else {
             return false;
         };
         let started = Instant::now();
         let unchanged = unsafe { im.server.owners_unchanged(&self.xconn) };
         tracing::trace!("XIM server owner check took {:?}", started.elapsed());
-        if unchanged {
-            if self.server_suspect.replace(false) {
-                tracing::info!("XIM server selection owner restored; resuming XIM requests");
-            }
-        } else if !self.server_suspect.replace(true) {
-            tracing::warn!(
-                "XIM server selection owner changed; skipping XIM requests until the server is \
-                 destroyed or replaced"
-            );
+        if unchanged && self.server_suspect.replace(false) {
+            tracing::info!("XIM server selection owner restored; resuming XIM requests");
         }
         unchanged
+    }
+
+    fn mark_suspect(&self) {
+        if !self.server_suspect.replace(true) {
+            tracing::warn!(
+                "XIM server selection owner changed but the server window is not destroyed yet; \
+                 skipping XIM requests until it is destroyed or replaced"
+            );
+        }
     }
 
     /// Like [`Self::server_reachable`], but when the owner changed, first lets libX11 handle a
@@ -87,7 +97,7 @@ impl ImeInner {
     /// which may replace `im` and `contexts`, so no reference into `*inner` may be held across
     /// this call, and it must not be called while iterating the contexts or from an XIM callback.
     pub unsafe fn ensure_server_alive(inner: *mut ImeInner) -> bool {
-        if unsafe { (*inner).server_reachable() } {
+        if unsafe { (*inner).owners_unchanged() } {
             return true;
         }
         let (im, windows) = match unsafe { (*inner).im.as_ref() } {
@@ -102,6 +112,7 @@ impl ImeInner {
             filtered |= unsafe { filter_queued_destroy_notify(&xconn, window) };
         }
         if !filtered {
+            unsafe { (*inner).mark_suspect() };
             return false;
         }
         // The destroy callback opened a new input method (a fallback or the new server). Its
