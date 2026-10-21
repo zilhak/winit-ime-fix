@@ -4,12 +4,16 @@ use std::sync::{Arc, Mutex};
 use std::{env, fmt, ptr};
 
 use super::super::atoms::*;
+use super::server::{current_locale_modifiers, ServerBinding};
 use super::{ffi, util, XConnection, XError};
 use x11rb::protocol::xproto;
 
 static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
-unsafe fn open_im(xconn: &Arc<XConnection>, locale_modifiers: &CStr) -> Option<ffi::XIM> {
+unsafe fn open_im(
+    xconn: &Arc<XConnection>,
+    locale_modifiers: &CStr,
+) -> Option<(ffi::XIM, ServerBinding)> {
     let _lock = GLOBAL_LOCK.lock();
 
     // XSetLocaleModifiers returns...
@@ -26,7 +30,10 @@ unsafe fn open_im(xconn: &Arc<XConnection>, locale_modifiers: &CStr) -> Option<f
     if im.is_null() {
         None
     } else {
-        Some(im)
+        // Read back the modifiers libX11 used: it appends `XMODIFIERS` to ours and keeps the
+        // previous value when ours are malformed.
+        let modifiers = unsafe { current_locale_modifiers(xconn) };
+        Some((im, unsafe { ServerBinding::record(xconn, &modifiers) }))
     }
 }
 
@@ -35,12 +42,25 @@ pub struct InputMethod {
     pub im: ffi::XIM,
     pub preedit_style: Style,
     pub none_style: Style,
+    pub server: ServerBinding,
     _name: String,
 }
 
 impl InputMethod {
-    fn new(xconn: &Arc<XConnection>, im: ffi::XIM, name: String) -> Option<Self> {
+    fn new(
+        xconn: &Arc<XConnection>,
+        im: ffi::XIM,
+        server: ServerBinding,
+        name: String,
+    ) -> Option<Self> {
         let mut styles: *mut XIMStyles = std::ptr::null_mut();
+
+        // Querying the styles waits for the server. If it was replaced right after opening, do not
+        // ask it; the input method is released by libX11 once the server window is destroyed.
+        if !unsafe { server.owners_unchanged(xconn) } {
+            tracing::warn!("XIM server changed while opening {name:?}; not querying input styles");
+            return None;
+        }
 
         // Query the styles supported by the XIM.
         unsafe {
@@ -83,7 +103,7 @@ impl InputMethod {
         let preedit_style = preedit_style.unwrap_or_else(|| none_style.unwrap());
         let none_style = none_style.unwrap_or(preedit_style);
 
-        Some(InputMethod { im, _name: name, preedit_style, none_style })
+        Some(InputMethod { im, _name: name, preedit_style, none_style, server })
     }
 }
 
@@ -251,7 +271,7 @@ impl PotentialInputMethod {
     pub fn open_im(&mut self, xconn: &Arc<XConnection>) -> Option<InputMethod> {
         let im = unsafe { open_im(xconn, &self.name.c_string) };
         self.successful = Some(im.is_some());
-        im.and_then(|im| InputMethod::new(xconn, im, self.name.string.clone()))
+        im.and_then(|(im, server)| InputMethod::new(xconn, im, server, self.name.string.clone()))
     }
 }
 
@@ -290,8 +310,10 @@ impl PotentialInputMethods {
                 // This is a standard input method that supports compose sequences, which should
                 // always be available. `@im=none` appears to mean the same thing.
                 PotentialInputMethod::from_str("@im=local"),
-                // This explicitly specifies to use the implementation-dependent default, though
-                // that seems to be equivalent to just using the local input method.
+                // This explicitly specifies to use the implementation-dependent default. libX11
+                // appends XMODIFIERS, but only the first `@im=` counts, so the name is empty: it
+                // uses the local input method when the locale has a compose file and otherwise
+                // connects to any available XIM server.
                 PotentialInputMethod::from_str("@im="),
             ],
             // The XIM_SERVERS property can have surprising values. For instance, when I exited

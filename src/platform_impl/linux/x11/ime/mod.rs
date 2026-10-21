@@ -4,6 +4,7 @@ mod callbacks;
 mod context;
 mod inner;
 mod input_method;
+mod server;
 
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -89,7 +90,8 @@ impl Ime {
             unsafe {
                 let result = set_destroy_callback(&xconn, input_method.im, &inner)
                     .map_err(ImeCreationError::SetDestroyCallbackFailed);
-                if result.is_err() {
+                // Closing waits for the server; skip it if the server already changed.
+                if result.is_err() && input_method.server.owners_unchanged(&xconn) {
                     let _ = close_im(&xconn, input_method.im);
                 }
                 result?;
@@ -105,6 +107,14 @@ impl Ime {
         self.inner.is_destroyed
     }
 
+    /// Whether synchronous XIM requests can be sent now. If the server selection changed owner,
+    /// a queued `DestroyNotify` of the server window is handled first, which may replace the input
+    /// method and every context; callers look them up again afterwards.
+    pub fn ensure_server_alive(&mut self) -> bool {
+        let inner: *mut ImeInner = &mut *self.inner;
+        unsafe { ImeInner::ensure_server_alive(inner) }
+    }
+
     // This pattern is used for various methods here:
     // Ok(_) indicates that nothing went wrong internally
     // Ok(true) indicates that the action was actually performed
@@ -114,7 +124,7 @@ impl Ime {
         window: ffi::Window,
         with_ime: bool,
     ) -> Result<bool, ImeContextCreationError> {
-        let context = if self.is_destroyed() {
+        let context = if !self.ensure_server_alive() {
             // Create empty entry in map, so that when IME is rebuilt, this window has a context.
             None
         } else {
@@ -137,8 +147,9 @@ impl Ime {
             Some(context)
         };
 
+        let created = context.is_some();
         self.inner.contexts.insert(window, context);
-        Ok(!self.is_destroyed())
+        Ok(created)
     }
 
     pub fn get_context(&self, window: ffi::Window) -> Option<ffi::XIC> {
@@ -153,9 +164,10 @@ impl Ime {
     }
 
     pub fn remove_context(&mut self, window: ffi::Window) -> Result<bool, XError> {
+        self.ensure_server_alive();
         if let Some(Some(context)) = self.inner.contexts.remove(&window) {
             unsafe {
-                self.inner.destroy_ic_if_necessary(context.ic)?;
+                self.inner.destroy_context(context)?;
             }
             Ok(true)
         } else {
@@ -164,7 +176,7 @@ impl Ime {
     }
 
     pub fn focus(&mut self, window: ffi::Window) -> Result<bool, XError> {
-        if self.is_destroyed() {
+        if !self.ensure_server_alive() {
             return Ok(false);
         }
         if let Some(&mut Some(ref mut context)) = self.inner.contexts.get_mut(&window) {
@@ -175,7 +187,7 @@ impl Ime {
     }
 
     pub fn unfocus(&mut self, window: ffi::Window) -> Result<bool, XError> {
-        if self.is_destroyed() {
+        if !self.ensure_server_alive() {
             return Ok(false);
         }
         if let Some(&mut Some(ref mut context)) = self.inner.contexts.get_mut(&window) {
@@ -189,13 +201,27 @@ impl Ime {
         if self.is_destroyed() {
             return;
         }
+        let alive = self.ensure_server_alive();
         if let Some(&mut Some(ref mut context)) = self.inner.contexts.get_mut(&window) {
-            context.set_spot(&self.xconn, x as _, y as _);
+            if alive {
+                context.set_spot(&self.xconn, x as _, y as _);
+            } else {
+                // Applied when the contexts are recreated for a new input method.
+                context.ic_spot = ffi::XPoint { x: x as _, y: y as _ };
+            }
         }
     }
 
     pub fn set_ime_allowed(&mut self, window: ffi::Window, allowed: bool) {
         if self.is_destroyed() {
+            return;
+        }
+
+        if !self.ensure_server_alive() {
+            // Applied when the contexts are recreated for a new input method.
+            if let Some(&mut Some(ref mut context)) = self.inner.contexts.get_mut(&window) {
+                context.allowed = allowed;
+            }
             return;
         }
 

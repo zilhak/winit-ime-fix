@@ -157,8 +157,18 @@ impl EventProcessor {
             let wt = Self::window_target(&self.target);
             let ime = wt.ime.as_ref();
             let window = self.active_window.map(|window| window as XWindow);
+            // Filtering a key may wait for the XIM server, so check that it is still the one the
+            // input method was opened with. The check may replace the input method, hence the
+            // second lookup.
             let forward_to_ime = ime
-                .and_then(|ime| window.map(|window| ime.borrow().is_ime_allowed(window)))
+                .and_then(|ime| {
+                    window.map(|window| {
+                        let mut ime = ime.borrow_mut();
+                        ime.is_ime_allowed(window)
+                            && ime.ensure_server_alive()
+                            && ime.is_ime_allowed(window)
+                    })
+                })
                 .unwrap_or(false);
 
             let filtered = forward_to_ime && self.filter_event(xev);

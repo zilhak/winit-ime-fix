@@ -7,7 +7,7 @@ use super::{ffi, XConnection, XError};
 
 use super::context::{ImeContext, ImeContextCreationError};
 use super::inner::{close_im, ImeInner};
-use super::input_method::PotentialInputMethods;
+use super::input_method::{InputMethod, PotentialInputMethods};
 
 pub(crate) unsafe fn xim_set_callback(
     xconn: &Arc<XConnection>,
@@ -83,6 +83,15 @@ enum ReplaceImError {
     MethodOpenFailed(#[allow(dead_code)] Box<PotentialInputMethods>),
     ContextCreationFailed(#[allow(dead_code)] ImeContextCreationError),
     SetDestroyCallbackFailed(#[allow(dead_code)] XError),
+    ServerChanged,
+}
+
+// Closes an input method that never became current. Closing waits for its server, so it is
+// skipped when the server already changed; libX11 frees it once the server window is destroyed.
+unsafe fn discard_new_im(xconn: &Arc<XConnection>, new_im: &InputMethod) {
+    if unsafe { new_im.server.owners_unchanged(xconn) } {
+        let _ = unsafe { close_im(xconn, new_im.im) };
+    }
 }
 
 // Attempt to replace current IM (which may or may not be presently valid) with a new one. This
@@ -109,11 +118,19 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
     {
         let result = unsafe { set_destroy_callback(xconn, new_im.im, &*inner) };
         if result.is_err() {
-            let _ = unsafe { close_im(xconn, new_im.im) };
+            unsafe { discard_new_im(xconn, &new_im) };
         }
         result
     }
     .map_err(ReplaceImError::SetDestroyCallbackFailed)?;
+
+    // Creating contexts and setting their spots wait for the new server. This only compares
+    // selection owners: filtering events here could re-enter this function through the destroy
+    // callback while the contexts are being iterated.
+    if !unsafe { new_im.server.owners_unchanged(xconn) } {
+        unsafe { discard_new_im(xconn, &new_im) };
+        return Err(ReplaceImError::ServerChanged);
+    }
 
     let mut new_contexts = HashMap::new();
     for (window, old_context) in unsafe { (*inner).contexts.iter() } {
@@ -135,7 +152,7 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
                 )
             };
             if result.is_err() {
-                let _ = unsafe { close_im(xconn, new_im.im) };
+                unsafe { discard_new_im(xconn, &new_im) };
             }
             result.map_err(ReplaceImError::ContextCreationFailed)?
         };
@@ -150,6 +167,7 @@ unsafe fn replace_im(inner: *mut ImeInner) -> Result<(), ReplaceImError> {
         (*inner).contexts = new_contexts;
         (*inner).is_destroyed = false;
         (*inner).is_fallback = is_fallback;
+        (*inner).server_suspect.set(false);
     }
     Ok(())
 }
@@ -168,6 +186,11 @@ pub unsafe extern "C" fn xim_instantiate_callback(
                 let _ = unset_instantiate_callback(xconn, client_data);
                 (*inner).is_fallback = false;
             },
+            // The new server changed owner right after it was opened; the instantiate callback
+            // stays registered and tries again.
+            Err(ReplaceImError::ServerChanged) => {
+                tracing::warn!("XIM server changed while reopening the input method")
+            },
             Err(err) => unsafe {
                 if (*inner).is_destroyed {
                     // We have no usable input methods!
@@ -182,13 +205,20 @@ pub unsafe extern "C" fn xim_instantiate_callback(
 // happens, XCloseIM/XDestroyIC doesn't need to be called, as the resources have already been
 // free'd (attempting to do so causes our connection to freeze).
 pub unsafe extern "C" fn xim_destroy_callback(
-    _xim: ffi::XIM,
+    xim: ffi::XIM,
     client_data: ffi::XPointer,
     // This field is unsupplied.
     _call_data: ffi::XPointer,
 ) {
     let inner: *mut ImeInner = client_data as _;
     if !inner.is_null() {
+        // An input method that is no longer current (left to libX11 because its server changed
+        // owner, see `discard_new_im` and `ImeInner::close_im_if_necessary`) is being freed.
+        // The current one is unaffected.
+        if unsafe { (*inner).im.as_ref() }.map(|im| im.im) != Some(xim) {
+            tracing::debug!("ignoring destruction of a replaced input method");
+            return;
+        }
         unsafe { (*inner).is_destroyed = true };
         let xconn = unsafe { &(*inner).xconn };
         if unsafe { !(*inner).is_fallback } {
@@ -196,6 +226,10 @@ pub unsafe extern "C" fn xim_destroy_callback(
             // Attempt to open fallback input method.
             match unsafe { replace_im(inner) } {
                 Ok(()) => unsafe { (*inner).is_fallback = true },
+                // Stays destroyed until the instantiate callback opens an input method.
+                Err(ReplaceImError::ServerChanged) => {
+                    tracing::warn!("XIM server changed while opening a fallback input method")
+                },
                 Err(err) => {
                     // We have no usable input methods!
                     panic!("Failed to open fallback input method: {err:?}");
