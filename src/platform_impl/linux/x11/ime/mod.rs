@@ -4,6 +4,7 @@ mod callbacks;
 mod context;
 mod inner;
 mod input_method;
+mod remote;
 mod server;
 
 use std::sync::mpsc::{Receiver, Sender};
@@ -27,6 +28,7 @@ pub enum ImeEvent {
     Update(String, usize),
     End,
     Disabled,
+    Commit(String),
 }
 
 pub type ImeReceiver = Receiver<ImeRequest>;
@@ -55,6 +57,7 @@ pub(crate) struct Ime {
     // The actual meat of this struct is boxed away, since it needs to have a fixed location in
     // memory so we can pass a pointer to it around.
     inner: Box<ImeInner>,
+    remote: Option<remote::Remote>,
 }
 
 impl Ime {
@@ -62,7 +65,8 @@ impl Ime {
         xconn: Arc<XConnection>,
         event_sender: ImeEventSender,
     ) -> Result<Self, ImeCreationError> {
-        let potential_input_methods = PotentialInputMethods::new(&xconn);
+        let remote = remote::Remote::new(xconn.clone(), event_sender.clone());
+        let potential_input_methods = PotentialInputMethods::new(&xconn, remote.is_some());
 
         let (mut inner, client_data) = {
             let mut inner = Box::new(ImeInner::new(xconn, potential_input_methods, event_sender));
@@ -100,7 +104,7 @@ impl Ime {
             // The initial open and its registration callback have fully returned. A pending
             // retry can now borrow PotentialInputMethods without reentering the initial borrow.
             unsafe { retry_reconnect(&mut *inner, false) };
-            Ok(Ime { xconn, inner })
+            Ok(Ime { xconn, inner, remote })
         } else {
             Err(ImeCreationError::OpenFailure(Box::new(inner.potential_input_methods)))
         }
@@ -125,7 +129,16 @@ impl Ime {
     }
 
     /// Runs at the outer event boundary, after any Xlib callback and before IME requests.
+    pub fn io_deadline(&self) -> Option<std::time::Instant> {
+        self.remote.as_ref().and_then(|r| r.deadline())
+    }
+    pub fn filter_remote(&mut self, event: &ffi::XEvent) -> Option<bool> {
+        self.remote.as_mut().and_then(|r| r.filter(event))
+    }
     pub fn retry_reconnect(&mut self, server_changed: bool) {
+        if let Some(remote) = self.remote.as_mut() {
+            remote.tick(server_changed);
+        }
         unsafe { retry_reconnect(&mut *self.inner, server_changed) };
     }
 
@@ -138,6 +151,9 @@ impl Ime {
         window: ffi::Window,
         with_ime: bool,
     ) -> Result<bool, ImeContextCreationError> {
+        if let Some(r) = self.remote.as_mut() {
+            r.context(window, with_ime);
+        }
         let context = if !self.ensure_server_alive() {
             // Create empty entry in map, so that when IME is rebuilt, this window has a context.
             None
@@ -178,6 +194,9 @@ impl Ime {
     }
 
     pub fn remove_context(&mut self, window: ffi::Window) -> Result<bool, XError> {
+        if let Some(r) = self.remote.as_mut() {
+            r.remove(window);
+        }
         self.ensure_server_alive();
         if let Some(Some(context)) = self.inner.contexts.remove(&window) {
             unsafe {
@@ -190,6 +209,9 @@ impl Ime {
     }
 
     pub fn focus(&mut self, window: ffi::Window) -> Result<bool, XError> {
+        if let Some(r) = self.remote.as_mut() {
+            r.focus(window, true);
+        }
         if !self.ensure_server_alive() {
             return Ok(false);
         }
@@ -201,6 +223,9 @@ impl Ime {
     }
 
     pub fn unfocus(&mut self, window: ffi::Window) -> Result<bool, XError> {
+        if let Some(r) = self.remote.as_mut() {
+            r.focus(window, false);
+        }
         if !self.ensure_server_alive() {
             return Ok(false);
         }
@@ -212,6 +237,9 @@ impl Ime {
     }
 
     pub fn send_xim_spot(&mut self, window: ffi::Window, x: i16, y: i16) {
+        if let Some(r) = self.remote.as_mut() {
+            r.spot(window, x, y);
+        }
         if self.is_destroyed() {
             return;
         }
@@ -227,6 +255,9 @@ impl Ime {
     }
 
     pub fn set_ime_allowed(&mut self, window: ffi::Window, allowed: bool) {
+        if let Some(r) = self.remote.as_mut() {
+            r.allowed(window, allowed);
+        }
         if self.is_destroyed() {
             return;
         }
@@ -245,8 +276,12 @@ impl Ime {
             }
         }
 
-        // Remove context for that window.
-        let _ = self.remove_context(window);
+        // Rebuild only the local context; the asynchronous context keeps its identity.
+        if let Some(Some(context)) = self.inner.contexts.remove(&window) {
+            if let Err(error) = unsafe { self.inner.destroy_context(context) } {
+                tracing::warn!("local input context replacement failed: {error:?}");
+            }
+        }
 
         // Create new context supporting IME input.
         let _ = self.create_context(window, allowed);

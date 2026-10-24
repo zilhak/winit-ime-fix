@@ -13,28 +13,49 @@ static GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 unsafe fn open_im(
     xconn: &Arc<XConnection>,
     locale_modifiers: &CStr,
+    restore_modifiers: bool,
 ) -> Option<(ffi::XIM, ServerBinding)> {
-    let _lock = GLOBAL_LOCK.lock();
+    let _lock = GLOBAL_LOCK.lock().expect("XIM locale lock poisoned");
+    let previous = restore_modifiers.then(|| unsafe { current_locale_modifiers(xconn) });
+    let result = (|| {
+        // XSetLocaleModifiers returns...
+        // * The current locale modifiers if it's given a NULL pointer.
+        // * The new locale modifiers if we succeeded in setting them.
+        // * NULL if the locale modifiers string is malformed or if the current locale is not supported
+        //   by Xlib.
+        let modifiers = unsafe { (xconn.xlib.XSetLocaleModifiers)(locale_modifiers.as_ptr()) };
+        if modifiers.is_null() {
+            return None;
+        }
+        if [b"@im=local".as_slice(), b"@im=none".as_slice()].contains(&locale_modifiers.to_bytes())
+        {
+            let actual = unsafe { current_locale_modifiers(xconn) };
+            let name = super::server::im_name_from_modifiers(&actual);
+            if name != b"local" && name != b"none" {
+                return None;
+            }
+        }
 
-    // XSetLocaleModifiers returns...
-    // * The current locale modifiers if it's given a NULL pointer.
-    // * The new locale modifiers if we succeeded in setting them.
-    // * NULL if the locale modifiers string is malformed or if the current locale is not supported
-    //   by Xlib.
-    unsafe { (xconn.xlib.XSetLocaleModifiers)(locale_modifiers.as_ptr()) };
+        let im = unsafe {
+            (xconn.xlib.XOpenIM)(xconn.display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut())
+        };
 
-    let im = unsafe {
-        (xconn.xlib.XOpenIM)(xconn.display, ptr::null_mut(), ptr::null_mut(), ptr::null_mut())
-    };
-
-    if im.is_null() {
-        None
-    } else {
-        // Read back the modifiers libX11 used: it appends `XMODIFIERS` to ours and keeps the
-        // previous value when ours are malformed.
-        let modifiers = unsafe { current_locale_modifiers(xconn) };
-        Some((im, unsafe { ServerBinding::record(xconn, im, &modifiers) }))
+        if im.is_null() {
+            None
+        } else {
+            // Read back the modifiers libX11 used: it appends `XMODIFIERS` to ours and keeps the
+            // previous value when ours are malformed.
+            let modifiers = unsafe { current_locale_modifiers(xconn) };
+            Some((im, unsafe { ServerBinding::record(xconn, im, &modifiers) }))
+        }
+    })();
+    if let Some(previous) = previous {
+        let previous = CString::new(previous).expect("Xlib locale modifier contains NUL");
+        if unsafe { (xconn.xlib.XSetLocaleModifiers)(previous.as_ptr()) }.is_null() {
+            tracing::warn!("could not restore the previous Xlib locale modifiers");
+        }
     }
+    result
 }
 
 #[derive(Debug)]
@@ -269,8 +290,12 @@ impl PotentialInputMethod {
         self.successful = None;
     }
 
-    pub fn open_im(&mut self, xconn: &Arc<XConnection>) -> Option<InputMethod> {
-        let im = unsafe { open_im(xconn, &self.name.c_string) };
+    pub fn open_im(
+        &mut self,
+        xconn: &Arc<XConnection>,
+        restore_modifiers: bool,
+    ) -> Option<InputMethod> {
+        let im = unsafe { open_im(xconn, &self.name.c_string, restore_modifiers) };
         self.successful = Some(im.is_some());
         im.and_then(|(im, server)| InputMethod::new(xconn, im, server, self.name.string.clone()))
     }
@@ -280,6 +305,7 @@ impl PotentialInputMethod {
 // came from, and if it succeeded.
 #[derive(Debug, Clone)]
 pub(crate) struct PotentialInputMethods {
+    local_only: bool,
     // On correctly configured systems, the XMODIFIERS environment variable tells us everything we
     // need to know.
     xmodifiers: Option<PotentialInputMethod>,
@@ -295,9 +321,14 @@ pub(crate) struct PotentialInputMethods {
 }
 
 impl PotentialInputMethods {
-    pub fn new(xconn: &Arc<XConnection>) -> Self {
-        let xmodifiers = env::var("XMODIFIERS").ok().map(PotentialInputMethod::from_string);
+    pub fn new(xconn: &Arc<XConnection>, local_only: bool) -> Self {
+        let xmodifiers = if local_only {
+            None
+        } else {
+            env::var("XMODIFIERS").ok().map(PotentialInputMethod::from_string)
+        };
         PotentialInputMethods {
+            local_only,
             // Since passing "" to XSetLocaleModifiers results in it defaulting to the value of
             // XMODIFIERS, it's worth noting what happens if XMODIFIERS is also "". If simply
             // running the program with `XMODIFIERS="" cargo run`, then assuming XMODIFIERS is
@@ -315,7 +346,7 @@ impl PotentialInputMethods {
                 // appends XMODIFIERS, but only the first `@im=` counts, so the name is empty: it
                 // uses the local input method when the locale has a compose file and otherwise
                 // connects to any available XIM server.
-                PotentialInputMethod::from_str("@im="),
+                PotentialInputMethod::from_str(if local_only { "@im=none" } else { "@im=" }),
             ],
             // The XIM_SERVERS property can have surprising values. For instance, when I exited
             // ibus to run fcitx, it retained the value denoting ibus. Even more surprising is
@@ -348,7 +379,7 @@ impl PotentialInputMethods {
         self.reset();
 
         if let Some(ref mut input_method) = self.xmodifiers {
-            let im = input_method.open_im(xconn);
+            let im = input_method.open_im(xconn, self.local_only);
             if let Some(im) = im {
                 return XModifiers(im);
             } else if let Some(ref callback) = callback {
@@ -357,7 +388,7 @@ impl PotentialInputMethods {
         }
 
         for input_method in &mut self.fallbacks {
-            let im = input_method.open_im(xconn);
+            let im = input_method.open_im(xconn, self.local_only);
             if let Some(im) = im {
                 return Fallback(im);
             }

@@ -92,6 +92,13 @@ impl EventProcessor {
         };
         self.process_xevent(xev, &mut callback);
 
+        self.process_ime(server_changed, &mut callback);
+    }
+
+    pub fn process_ime<T: 'static, F>(&mut self, server_changed: bool, mut callback: F)
+    where
+        F: FnMut(&RootAEL, Event<T>),
+    {
         let window_target = Self::window_target_mut(&mut self.target);
         if let Some(ime) = window_target.ime.as_mut() {
             ime.get_mut().retry_reconnect(server_changed);
@@ -131,6 +138,10 @@ impl EventProcessor {
                     // Issue empty preedit on `Done`.
                     WindowEvent::Ime(Ime::Preedit(String::new(), None))
                 },
+                ImeEvent::Commit(text) => {
+                    self.is_composing = false;
+                    WindowEvent::Ime(Ime::Commit(text))
+                },
                 ImeEvent::Disabled => {
                     self.is_composing = false;
                     WindowEvent::Ime(Ime::Disabled)
@@ -167,7 +178,13 @@ impl EventProcessor {
         // and forward back. This is not desired for e.g. games since some IMEs may delay the input
         // and game can toggle IME back when e.g. typing into some field where latency won't really
         // matter.
-        let filtered = if event_type == xlib::KeyPress || event_type == xlib::KeyRelease {
+        let remote_filtered = {
+            let wt = Self::window_target(&self.target);
+            wt.ime.as_ref().and_then(|ime| ime.borrow_mut().filter_remote(xev))
+        };
+        let filtered = if let Some(filtered) = remote_filtered {
+            filtered
+        } else if event_type == xlib::KeyPress || event_type == xlib::KeyRelease {
             let wt = Self::window_target(&self.target);
             let ime = wt.ime.as_ref();
             let window = self.active_window.map(|window| window as XWindow);
@@ -185,23 +202,22 @@ impl EventProcessor {
                 })
                 .unwrap_or(false);
 
-            let filtered = forward_to_ime && self.filter_event(xev);
-            if filtered {
-                let xev: &XKeyEvent = xev.as_ref();
-                if self.xmodmap.is_modifier(xev.keycode as u8) {
-                    // Don't grow the buffer past the `MAX_MOD_REPLAY_LEN`. This could happen
-                    // when the modifiers are consumed entirely.
-                    if self.xfiltered_modifiers.len() == MAX_MOD_REPLAY_LEN {
-                        self.xfiltered_modifiers.pop_back();
-                    }
-                    self.xfiltered_modifiers.push_front(xev.keycode as u8);
-                }
-            }
-
-            filtered
+            forward_to_ime && self.filter_event(xev)
         } else {
             self.filter_event(xev)
         };
+
+        if filtered && (event_type == xlib::KeyPress || event_type == xlib::KeyRelease) {
+            let xev: &XKeyEvent = xev.as_ref();
+            if self.xmodmap.is_modifier(xev.keycode as u8) {
+                // Don't grow the buffer past the `MAX_MOD_REPLAY_LEN`. This could happen
+                // when the modifiers are consumed entirely.
+                if self.xfiltered_modifiers.len() == MAX_MOD_REPLAY_LEN {
+                    self.xfiltered_modifiers.pop_back();
+                }
+                self.xfiltered_modifiers.push_front(xev.keycode as u8);
+            }
+        }
 
         // Don't process event if it was filtered.
         if filtered {
@@ -704,10 +720,10 @@ impl EventProcessor {
             drop(shared_state_lock);
 
             if moved {
-                callback(&self.target, Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::Moved(outer.into()),
-                });
+                callback(
+                    &self.target,
+                    Event::WindowEvent { window_id, event: WindowEvent::Moved(outer.into()) },
+                );
             }
             outer
         };
@@ -752,13 +768,16 @@ impl EventProcessor {
                 drop(shared_state_lock);
 
                 let inner_size = Arc::new(Mutex::new(new_inner_size));
-                callback(&self.target, Event::WindowEvent {
-                    window_id,
-                    event: WindowEvent::ScaleFactorChanged {
-                        scale_factor: new_scale_factor,
-                        inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
+                callback(
+                    &self.target,
+                    Event::WindowEvent {
+                        window_id,
+                        event: WindowEvent::ScaleFactorChanged {
+                            scale_factor: new_scale_factor,
+                            inner_size_writer: InnerSizeWriter::new(Arc::downgrade(&inner_size)),
+                        },
                     },
-                });
+                );
 
                 let new_inner_size = *inner_size.lock().unwrap();
                 drop(inner_size);
@@ -805,10 +824,13 @@ impl EventProcessor {
         }
 
         if resized {
-            callback(&self.target, Event::WindowEvent {
-                window_id,
-                event: WindowEvent::Resized(new_inner_size.into()),
-            });
+            callback(
+                &self.target,
+                Event::WindowEvent {
+                    window_id,
+                    event: WindowEvent::Resized(new_inner_size.into()),
+                },
+            );
         }
     }
 
@@ -1530,10 +1552,13 @@ impl EventProcessor {
         }
         let physical_key = xkb::raw_keycode_to_physicalkey(keycode);
 
-        callback(&self.target, Event::DeviceEvent {
-            device_id,
-            event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
-        });
+        callback(
+            &self.target,
+            Event::DeviceEvent {
+                device_id,
+                event: DeviceEvent::Key(RawKeyEvent { physical_key, state }),
+            },
+        );
     }
 
     fn xinput2_hierarchy_changed<T: 'static, F>(&mut self, xev: &XIHierarchyEvent, mut callback: F)
@@ -1548,15 +1573,21 @@ impl EventProcessor {
         for info in infos {
             if 0 != info.flags & (xinput2::XISlaveAdded | xinput2::XIMasterAdded) {
                 self.init_device(info.deviceid as xinput::DeviceId);
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Added,
-                });
+                callback(
+                    &self.target,
+                    Event::DeviceEvent {
+                        device_id: mkdid(info.deviceid as xinput::DeviceId),
+                        event: DeviceEvent::Added,
+                    },
+                );
             } else if 0 != info.flags & (xinput2::XISlaveRemoved | xinput2::XIMasterRemoved) {
-                callback(&self.target, Event::DeviceEvent {
-                    device_id: mkdid(info.deviceid as xinput::DeviceId),
-                    event: DeviceEvent::Removed,
-                });
+                callback(
+                    &self.target,
+                    Event::DeviceEvent {
+                        device_id: mkdid(info.deviceid as xinput::DeviceId),
+                        event: DeviceEvent::Removed,
+                    },
+                );
                 let mut devices = self.devices.borrow_mut();
                 devices.remove(&DeviceId(info.deviceid as xinput::DeviceId));
             }
@@ -1872,7 +1903,7 @@ impl EventProcessor {
                 .find(|prev_monitor| prev_monitor.name == new_monitor.name)
                 .map(|prev_monitor| prev_monitor.scale_factor);
             if Some(new_monitor.scale_factor) != maybe_prev_scale_factor {
-                for window in wt.windows.borrow().iter().filter_map(|(_, w)| w.upgrade()) {
+                for window in wt.windows.borrow().values().filter_map(|w| w.upgrade()) {
                     window.refresh_dpi_for_monitor(&new_monitor, maybe_prev_scale_factor, |event| {
                         callback(&self.target, event);
                     })

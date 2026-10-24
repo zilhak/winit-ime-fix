@@ -190,7 +190,7 @@ impl<T: 'static> EventLoop<T> {
             // Remember default locale to restore it if target locale is unsupported
             // by Xlib
             let default_locale = setlocale(LC_CTYPE, ptr::null());
-            setlocale(LC_CTYPE, b"\0".as_ptr() as *const _);
+            setlocale(LC_CTYPE, c"".as_ptr());
 
             // Check if set locale is supported by Xlib.
             // If not, calls to some Xlib functions like `XSetLocaleModifiers`
@@ -463,6 +463,12 @@ impl<T: 'static> EventLoop<T> {
             min_timeout(control_flow_timeout, timeout)
         };
 
+        let ime_deadline = EventProcessor::window_target(&self.event_processor.target)
+            .ime
+            .as_ref()
+            .and_then(|ime| ime.borrow().io_deadline());
+        timeout =
+            min_timeout(timeout, ime_deadline.map(|d| d.saturating_duration_since(Instant::now())));
         self.state.x11_readiness = Readiness::EMPTY;
         if let Err(error) =
             self.event_loop.dispatch(timeout, &mut self.state).map_err(std::io::Error::from)
@@ -567,6 +573,8 @@ impl<T: 'static> EventLoop<T> {
                 );
             }
         }
+
+        self.event_processor.process_ime(false, |target, event| callback(event, target));
 
         // This is always the last event we dispatch before poll again
         {
@@ -1004,15 +1012,18 @@ impl Device {
                 let ty = unsafe { (*class_ptr)._type };
                 if ty == ffi::XIScrollClass {
                     let info = unsafe { &*(class_ptr as *const ffi::XIScrollClassInfo) };
-                    scroll_axes.push((info.number, ScrollAxis {
-                        increment: info.increment,
-                        orientation: match info.scroll_type {
-                            ffi::XIScrollTypeHorizontal => ScrollOrientation::Horizontal,
-                            ffi::XIScrollTypeVertical => ScrollOrientation::Vertical,
-                            _ => unreachable!(),
+                    scroll_axes.push((
+                        info.number,
+                        ScrollAxis {
+                            increment: info.increment,
+                            orientation: match info.scroll_type {
+                                ffi::XIScrollTypeHorizontal => ScrollOrientation::Horizontal,
+                                ffi::XIScrollTypeVertical => ScrollOrientation::Vertical,
+                                _ => unreachable!(),
+                            },
+                            position: 0.0,
                         },
-                        position: 0.0,
-                    }));
+                    ));
                 }
             }
         }

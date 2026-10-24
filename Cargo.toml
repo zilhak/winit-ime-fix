@@ -10,7 +10,7 @@ keywords = ["windowing"]
 readme = "README.md"
 documentation = "https://docs.rs/winit"
 categories = ["gui"]
-rust-version.workspace = true
+rust-version = "1.82"
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -58,7 +58,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 # Features are documented in either `lib.rs` or under `winit::platform`.
 [features]
 default = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"]
-x11 = ["x11-dl", "bytemuck", "percent-encoding", "xkbcommon-dl/x11", "x11rb"]
+x11 = ["dep:xim-parser", "dep:xim-ctext", "x11-dl", "bytemuck", "percent-encoding", "xkbcommon-dl/x11", "x11rb"]
 wayland = [
     "wayland-client",
     "wayland-backend",
@@ -278,6 +278,8 @@ wayland-protocols = { version = "0.32.8", features = [
 wayland-protocols-plasma = { version = "0.3.8", features = [
     "client",
 ], optional = true }
+xim-parser = { version = "=0.2.2", optional = true }
+xim-ctext = { version = "=0.4.1", optional = true }
 x11-dl = { version = "2.19.1", optional = true }
 x11rb = { version = "0.13.0", default-features = false, features = [
     "allow-unsafe-code",
