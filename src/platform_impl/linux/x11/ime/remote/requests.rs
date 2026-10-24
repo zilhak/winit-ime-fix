@@ -78,7 +78,7 @@ impl Remote {
             let Some(id) =
                 self.contexts.get(&k.window).filter(|c| c.allowed && !c.removed).and_then(|c| c.id)
             else {
-                self.replay_key(k);
+                self.replay_key(k, ReplayRoute::LocalCompose);
                 return Ok(());
             };
             let xev = xim_parser::XEvent {

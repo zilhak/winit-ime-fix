@@ -27,6 +27,11 @@ enum Wait {
     Destroy(u16),
     Key(u16),
 }
+#[derive(Clone, Copy)]
+enum ReplayRoute {
+    ServerFiltered,
+    LocalCompose,
+}
 struct Pending {
     kind: Wait,
     until: Instant,
@@ -56,7 +61,7 @@ pub(super) struct Remote {
     attrs: HashMap<AttributeName, u16>,
     contexts: HashMap<ffi::Window, Context>,
     keys: VecDeque<ffi::XKeyEvent>,
-    replay: VecDeque<ffi::XKeyEvent>,
+    replay: VecDeque<(ffi::XKeyEvent, ReplayRoute)>,
     retired_owners: VecDeque<u32>,
 }
 impl Remote {
@@ -131,12 +136,12 @@ impl Remote {
             value: xim_parser::write_to_vec(value),
         })
     }
-    fn replay_key(&mut self, key: ffi::XKeyEvent) {
+    fn replay_key(&mut self, key: ffi::XKeyEvent, route: ReplayRoute) {
         let mut event = ffi::XEvent { key };
         unsafe {
             (self.x.xlib.XPutBackEvent)(self.x.display, &mut event);
         }
-        self.replay.push_front(key);
+        self.replay.push_front((key, route));
     }
     fn retire(&mut self, reason: &str) {
         tracing::warn!("XIM connection retired: {reason}; local compose remains available");
@@ -169,7 +174,7 @@ impl Remote {
         self.contexts.retain(|_, c| !c.removed);
         while let Some(k) = self.keys.pop_back() {
             if self.contexts.get(&k.window).is_some_and(|c| c.focused && c.allowed) {
-                self.replay_key(k);
+                self.replay_key(k, ReplayRoute::LocalCompose);
             }
         }
     }
@@ -241,11 +246,24 @@ impl Remote {
         let kind = e.get_type();
         if kind == ffi::KeyPress || kind == ffi::KeyRelease {
             let key = unsafe { e.key };
-            if self.replay.front().is_some_and(|k| same_key(k, &key)) {
-                self.replay.pop_front();
-                return Some(
-                    !self.contexts.get(&key.window).is_some_and(|c| c.focused && !c.removed),
-                );
+            if self.replay.front().is_some_and(|(k, _)| same_key(k, &key)) {
+                let (_, route) = self.replay.pop_front().unwrap();
+                if !self.contexts.get(&key.window).is_some_and(|c| {
+                    c.focused
+                        && !c.removed
+                        && match route {
+                            ReplayRoute::LocalCompose => c.allowed,
+                            ReplayRoute::ServerFiltered => true,
+                        }
+                }) {
+                    return Some(true);
+                }
+                // Only server-returned keys have already passed an IM filter. Unsent fallback
+                // must still traverse local XFilterEvent, including its generated compose events.
+                return match route {
+                    ReplayRoute::ServerFiltered => Some(false),
+                    ReplayRoute::LocalCompose => None,
+                };
             }
             let c = self.contexts.get(&key.window)?;
             if !c.allowed || c.id.is_none() || self.transport.is_none() {

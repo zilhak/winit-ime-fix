@@ -97,6 +97,11 @@ impl Remote {
                 let Some(Wait::Create(w)) = self.pending.as_ref().map(|p| p.kind) else {
                     return Err("unexpected context reply".into());
                 };
+                // An IC remains owned until its destroy is confirmed, even if its window was
+                // removed. Reject aliases before completing the pending request or changing owners.
+                if self.contexts.values().any(|c| c.id == Some(input_context_id)) {
+                    return Err("duplicate live XIM context".into());
+                }
                 self.complete(Wait::Create(w))?;
                 if let Some(c) = self.contexts.get_mut(&w) {
                     c.id = Some(input_context_id);
@@ -159,7 +164,7 @@ impl Remote {
                     serial: xev.sequence as _,
                     send_event: 0,
                 };
-                self.replay_key(key);
+                self.replay_key(key, ReplayRoute::ServerFiltered);
                 if flag.contains(ForwardEventFlag::SYNCHRONOUS) {
                     self.sync(input_method_id, input_context_id)?;
                 }
